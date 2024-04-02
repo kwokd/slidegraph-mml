@@ -4,8 +4,11 @@ parser.add_argument('-p',"--process", help="process graphs to also store omics d
                     action="store_true")
 parser.add_argument('-f','--feature_set',help="select feature set: SHUFFLE, RES, CC available",
                     default="SHUFFLE")
-parser.add_argument('--fusion',help="methodology for fusion: BILINEAR vs SIMPLE vs CONCAT",
-                    default="BILINEAR")
+parser.add_argument('--fusion',help="methodology for fusion: GATED vs BILINEAR vs LINEAR vs CONCAT",
+                    default="GATED")
+parser.add_argument('--omics_concat', help="use concatenation to graph instead of net for omics",
+                    action="store_true")
+
 parser.add_argument('--lr', help="learning rate for optimiser",
                     default=0.00002)
 parser.add_argument('--weight_decay', help="weight decay for optimiser",
@@ -14,11 +17,12 @@ parser.add_argument('--batch_number', help="number of batches to train/test for"
                     default=2000)
 parser.add_argument('--omics_len', help="length of omics data for each patient",
                     default=95)
-parser.add_argument('--figure_dir', help="directory to save figures to",
-                    default="./figures")
+
 parser.add_argument("--modelsummary", help="print structure of best model using torchinfo at end",
                     action="store_true")
-parser.add_argument("--noplot", help="suppress plotting of losses",
+parser.add_argument('--figure_dir', help="directory to save figures to",
+                    default="./figures")
+parser.add_argument("--noplot", help="suppress plotting of losses and KM curves",
                     action="store_true")
 args = parser.parse_known_args()[0]
 
@@ -31,6 +35,7 @@ import pdb
 import pickle
 import math
 import re
+import sys
 
 from glob import glob
 from copy import deepcopy
@@ -67,6 +72,9 @@ from torchinfo import summary
 
 print(args)
 print("*****")
+print(args, file=sys.stderr)
+print("*****", file=sys.stderr)
+
 #"parameters for the model"
 LEARNING_RATE = args.lr
 WEIGHT_DECAY = args.weight_decay
@@ -116,7 +124,10 @@ DEVICE = {
 PROCESS_GRAPHS = args.process
 FUSION = args.fusion
 
+START_TIME=int(time())
+
 #"end of the constants declaration"
+
 def toTensor(v,dtype = torch.float,requires_grad = True):
     return torch.from_numpy(np.array(v)).type(dtype).requires_grad_(requires_grad)
 
@@ -174,7 +185,8 @@ def SplitOnEvent(event_time, numSplits, testSize):
 def disk_graph_load(batch):
     # takes list of patient codes, returns list of corresponding loaded
     # pkls (graph Data/MMLData objects)
-    return [torch.load(PKLDIR + '/' + graph + '.g') for graph in batch]
+    loaded_graphs = [torch.load(PKLDIR + '/' + graph + '.g') for graph in batch]
+    return [MMLData(**(data.to_dict())) for data in loaded_graphs]
 
 def get_predictions(model,graphs,device=torch.device('cuda:0')) -> list:
     # removed dependency on omics_df, can cascade deletion
@@ -322,6 +334,7 @@ class MaxNet(nn.Module):
     def forward(self, x):
         # x comes in as one long vector 
         # instead of width 95
+        # cannot solve the batching problem. just leave the reshape as is
         omics_in = x.reshape([-1,OMICS_LEN])
         
         features = self.encoder(omics_in)
@@ -403,6 +416,7 @@ class GNN(torch.nn.Module):
         out = 0
         Z_sum = 0
         ##### convert x down from double? solves issue with the input to linear layers
+        ## but, loses some precision
         x = x.float() 
         
         # Z_sum is the result of linear layers
@@ -432,20 +446,21 @@ class GNN(torch.nn.Module):
 # Fusion
 ############
 class SimpleFusion(nn.Module):
-    def init(self, dim1=32, dim2=32, dim_out=64, bilinear=True, cat_only=False):
+    def __init__(self, dim1=32, dim2=32, dim_out=64, bilinear=True, cat_only=False):
         super(SimpleFusion,self).__init__()
         self.bilinear = bilinear
         self.cat_only = cat_only
         if self.bilinear:
-            self.fuse = nn.Sequential(nn.Bilinear(dim1, dim2, dim_out), nn.ReLU())
+            self.fuse = nn.Bilinear(dim1, dim2, dim_out)
+            self.relu = nn.ReLU()
         else:
             self.fuse = nn.Sequential(nn.Linear(dim1+dim2, dim_out), nn.ReLU())
         
     def forward(self, vec1, vec2):
         if self.bilinear:
-            return self.fuse(vec1,vec2)
+            return self.relu(self.fuse(vec1,vec2))
         else:
-            conc = torch.cat(vec1,vec2,dim=1)
+            conc = torch.cat((vec1,vec2),dim=1)
             if self.cat_only: 
                 return conc
             else: 
@@ -474,9 +489,11 @@ class BilinearFusion(nn.Module):
         self.linear_h1 = nn.Sequential(
             nn.Linear(dim1_og, dim1), 
             nn.ReLU())
+        
         self.linear_z1 = (
             nn.Bilinear(dim1_og, dim2_og, dim1) if use_bilinear else 
             nn.Sequential(nn.Linear(dim1_og+dim2_og, dim1)))
+        
         self.linear_o1 = nn.Sequential(
             nn.Linear(dim1, dim1), 
             nn.ReLU(), 
@@ -486,9 +503,11 @@ class BilinearFusion(nn.Module):
         self.linear_h2 = nn.Sequential(
             nn.Linear(dim2_og, dim2), 
             nn.ReLU())
+        
         self.linear_z2 = (
             nn.Bilinear(dim1_og, dim2_og, dim2) if use_bilinear else 
             nn.Sequential(nn.Linear(dim1_og+dim2_og, dim2)))
+        
         self.linear_o2 = nn.Sequential(
             nn.Linear(dim2, dim2), 
             nn.ReLU(), 
@@ -507,6 +526,10 @@ class BilinearFusion(nn.Module):
 
     def forward(self, vec1, vec2):
         ### Gated Multimodal Units
+        # h: rescale vec1/vec2 by scale_dim, pass relu
+        # z: bilinear/linear by concat with both vec input, output to be same size as corresponding h
+        # o: sigmoid of z multiplied by h as input to fc layer
+
         if self.gate1:
             h1 = self.linear_h1(vec1)
             z1 = (
@@ -556,15 +579,24 @@ class GraphomicNet(nn.Module):
         Linear 64 to 1
     Possible alternative configurations:
         - Concatenation at feature vector level, then FC (linear)
-        - Replace Maxnet with single FC (linear) layer
+            - i.e. 32 + 95 to 1
+        - Replace Maxnet with single FC (linear/bilinear) layer that transforms 95 to 32
+            - then 32 + 32 to 1
+        - Pre-output fusion; both nets produce an independent scalar output, we fuse here
     """
     def __init__(self, omic_input_len, act=None):
         super(GraphomicNet, self).__init__()
+
+        graph_features = FEATURES
+        omic_features = OMICS_LEN
+        fusion_length = graph_features+omic_features
+
+        graph_target = 32
         
         self.grph_net = GNN(
-            dim_features=FEATURES,
-            dim_target = 32,
-            layers = [64,48,32,32],
+            dim_features=graph_features,
+            dim_target = graph_target,
+            layers = [64,64,32,32],
             dropout = 0.0,
             pooling = 'mean', 
             conv='EdgeConv', 
@@ -576,39 +608,69 @@ class GraphomicNet(nn.Module):
         
         # alternatively, we could concatenate the omics vector to the
         # graph feature rep and fuse directly from there
+
+        # concat - concatenate maxnet features to slidegraph features
+        # omics_concat - concatenate omics features to slidegraph features
+        if not args.omics_concat:
+            self.omic_net = MaxNet(
+                input_dim=omic_input_len, 
+                omic_dim=32, 
+                dropout_rate=0.25, 
+                act=None, 
+                label_dim=1,
+                init_max=True
+                ).to(DEVICE)
+            ### need to decide what to do from here based on fusion strategy
+            if FUSION == "GATED":
+                self.fusion = BilinearFusion()
+            elif FUSION == "BILINEAR":
+                self.fusion = SimpleFusion(bilinear=True)
+            elif FUSION == "LINEAR":
+                self.fusion = SimpleFusion(bilinear=False)
+            elif FUSION == "CONCAT":
+                self.fusion = SimpleFusion(bilinear=False,cat_only=True)
+            else:
+                raise NotImplementedError()
+        else:
+            if FUSION == "GATED":
+                self.fusion = BilinearFusion(dim2=OMICS_LEN)
+            elif FUSION == "BILINEAR":
+                self.fusion = SimpleFusion(dim2=OMICS_LEN, bilinear=True)
+            elif FUSION == "LINEAR":
+                self.fusion = SimpleFusion(dim2=OMICS_LEN, bilinear=False)
+            elif FUSION == "CONCAT":
+                self.fusion = SimpleFusion(dim2=OMICS_LEN, bilinear=False,cat_only=True)
+            else:
+                raise NotImplementedError()
         
-        self.omic_net = MaxNet(
-            input_dim=omic_input_len, 
-            omic_dim=32, 
-            dropout_rate=0.25, 
-            act=None, 
-            label_dim=1,
-            init_max=True
-            ).to(DEVICE)
-        
-        ### need to decide what to do from here based on fusion strategy
-        ### less 
-        
-        self.fusion = BilinearFusion()
-        
-        self.simplefusion = SimpleFusion()
         # classifier will take output fused vector (64)
         # and collapse to single value (1) by single linear layer
-        self.classifier = nn.Sequential(nn.Linear(64, 1))
+        if not args.omics_concat:
+            self.classifier = nn.Sequential(nn.Linear(64, 1))
+        else:
+            print(graph_features+omic_features)
+            self.classifier = nn.Sequential(nn.Linear(graph_target+omic_features, 1))
         self.act = act
-
-        # dfs_freeze(self.grph_net)
-        # dfs_freeze(self.omic_net)
+        
         self.output_range = Parameter(torch.FloatTensor([6]), requires_grad=False)
         self.output_shift = Parameter(torch.FloatTensor([-3]), requires_grad=False)
 
     def forward(self, data):
         grph_vec, _, _ = self.grph_net(data)
-        omic_vec, _ = self.omic_net(data.omics_tensor)
-        # data is batched, so omics tensor is concatenated to single vector. 
+        ### additional option to not use the net? and concat directly
+
+        # batched, so omics tensor is concatenated to single long vector. 
         # must reshape after passing to net
+        # print(f"Graph shape:{grph_vec.shape}")
+        if not args.omics_concat:
+            omic_vec, _ = self.omic_net(data.omics_tensor)
+        else:
+            omic_vec = data.omics_tensor
+            omic_vec = omic_vec.reshape([-1,OMICS_LEN])
         
-        if args.fusion == "BILINEAR":
+        
+        if FUSION == "GATED":
+            # original logic
             features = self.fusion(grph_vec, omic_vec)
             hazard = self.classifier(features)
             
@@ -618,9 +680,10 @@ class GraphomicNet(nn.Module):
                     hazard = hazard * self.output_range + self.output_shift
             
             return hazard, features
-        elif args.fusion == "CONC":
-            features = self.simplefusion(grph_vec, omic_vec)
-            self.classifier = nn.Sequential(nn.Linear(64, 1))
+        else:
+            features = self.fusion(grph_vec, omic_vec)
+            hazard = self.classifier(features)
+            return hazard, features
 
     def __hasattr__(self, name):
         if '_parameters' in self.__dict__:
@@ -648,9 +711,13 @@ class NetWrapper:
         unzipped = [j for pair in batch for j in pair]
         tag_set = list(set(unzipped))
         graphs = disk_graph_load(tag_set)
+
+        # for graph in graphs:
+        #     print(graph)
         
         batch_load = DataLoader(graphs, batch_size = len(graphs))
-        for data in batch_load: data = data.to(DEVICE)
+        for data in batch_load:
+            data = data.to(DEVICE)
         
         z = toTensorGPU(0)
         loss = 0
@@ -724,6 +791,7 @@ class NetWrapper:
         # To resolve list index errors with large NUM_BATCHES vals
         counter = 0 
         
+        ### understand the batching logic next TODO
         for i in tqdm(range(max_batches)):
             if counter < len(training_indexes) - batch_size:
                 batch_pairs = []
@@ -798,8 +866,12 @@ class Evaluator:
         add_at_risk_counts(km_high, km_low, ax=ax)
         plt.title('Kaplan-Meier estimate')
         plt.ylabel('Survival probability')
-        plt.show()
+        # plt.show()
         plt.tight_layout()
+        kmpath = f"{args.figure_dir}/{FEATURE_SET}_{FUSION}_{args.omics_concat}-{int(time())}.png"
+        plt.savefig(kmpath)
+        print(f"KM curves plotted to {kmpath}.")
+        plt.clf()
         
         results = logrank_test(T_low, T_high, E_low, E_high)
         print("p-value %s; log-rank %s" % (results.p_value, np.round(results.test_statistic, 6)))
@@ -807,7 +879,7 @@ class Evaluator:
 def GraphProcessing(omics_df:OmicsWrapper, tag_survlist):
     print("Pre-saving graphs.")
     for tag, label in tqdm(tag_survlist):
-        G = Data(**(loadfromjson(tag)))
+        G = MMLData(**(loadfromjson(tag)))
         try:
             G.y = toTensorGPU([int(label[1])], dtype=torch.long, requires_grad = False)
         except ValueError:
@@ -815,6 +887,7 @@ def GraphProcessing(omics_df:OmicsWrapper, tag_survlist):
         # creates new graph edges, where nodes that are 1500 apart are connected to each other
         W = radius_neighbors_graph(toNumpy(G.coords), 1500, mode="connectivity",include_self=False).toarray()
         g = toGeometricWW(toNumpy(G.x),W,toNumpy(G.y))
+        # is this MMLData? or Data?
         g.coords = G.coords
         g.event = toTensor(label[0])
         g.e_time = toTensor(label[1])
@@ -867,6 +940,8 @@ if __name__ == '__main__':
         # fold_concord and converg_vals are never used?
         eval_metrics.append(concord)
         #m = max(concords)
+        if not args.noplot:
+            eval.K_M_Curves(testDataset,None)
     
     if args.modelsummary:
         print(summary(BestModel))
@@ -879,7 +954,7 @@ if __name__ == '__main__':
     
     if not args.noplot:
         for i,lossvals in enumerate(converg_vals):
-            figpath = f"{args.figure_dir}/{FEATURE_SET}_{FUSION}-{time()}-fold{i+1}.png"
+            figpath = f"{args.figure_dir}/{FEATURE_SET}_{FUSION}_{args.omics_concat}-{START_TIME}-fold{i+1}.png"
             f = plt.figure()
             f.set_figwidth(12)
             plt.plot(lossvals["train"])
