@@ -26,6 +26,8 @@ parser.add_argument("--noplot", help="suppress plotting of losses and KM curves"
                     action="store_true")
 args = parser.parse_known_args()[0]
 
+###########################
+
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -70,6 +72,10 @@ from lifelines.statistics import logrank_test
 
 from torchinfo import summary
 
+from networks.graph_net import *
+from networks.omics_net import *
+from networks.fusion import *
+
 print(args)
 print("*****")
 print(args, file=sys.stderr)
@@ -105,9 +111,6 @@ PKL_PATH = {
 print(f"*****\nFeature set: {FEATURE_SET}\nNode features: {FEATURES}\nGraph path: {GRAPH_PATH}\nPickle path: {PKL_PATH}\n*****")
 
 # "directories"
-BDIR = GRAPH_PATH
-PKLDIR = PKL_PATH
-
 SURV_FILE = './data/NIHMS978596-supplement-1.xlsx'
 CLINI_FILE = './data/TCGA-BRCA-DX_CLINI (8).xlsx'
 
@@ -124,7 +127,7 @@ FUSION = args.fusion
 
 START_TIME=int(time())
 
-#"end of the constants declaration"
+###########################
 
 def toTensor(v,dtype = torch.float,requires_grad = True):
     return torch.from_numpy(np.array(v)).type(dtype).requires_grad_(requires_grad)
@@ -183,7 +186,7 @@ def SplitOnEvent(event_time, numSplits, testSize):
 def disk_graph_load(batch):
     # takes list of patient codes, returns list of corresponding loaded
     # pkls (graph Data/MMLData objects)
-    loaded_graphs = [torch.load(PKLDIR + '/' + graph + '.g') for graph in batch]
+    loaded_graphs = [torch.load(PKL_PATH + '/' + graph + '.g') for graph in batch]
     return [MMLData(**(data.to_dict())) for data in loaded_graphs]
 
 def get_predictions(model,graphs,device=torch.device('cuda:0')) -> list:
@@ -209,14 +212,14 @@ def get_predictions(model,graphs,device=torch.device('cuda:0')) -> list:
             e_and_t.append(temp)
     return outputs, e_and_t
 
-def get_patient_tags(directory = BDIR):
+def get_patient_tags(directory = GRAPH_PATH):
     # returns a list of all patient tags that have json graph data
     # first 12 characters of graph json filename should be the patient barcode
     json_list = glob(os.path.join(directory, "*.json"))
     return [os.path.split(filename)[-1][:12] for filename in json_list if "DX1" in filename]
     # what does dx2 mean????
 
-def resolve_graph_filename(tag, directory = BDIR):
+def resolve_graph_filename(tag, directory = GRAPH_PATH):
     # takes a single patient tag, returns a single filename Path
     return Path(directory) / (tag + "-01Z-00-DX1.json")
 
@@ -236,7 +239,7 @@ def init_max_weights(module):
             m.weight.data.normal_(0, stdv)
             m.bias.data.zero_()
 
-class OmicsWrapper:
+class DFWrapper:
     # wrapper for the dataframe containing omics data
     def __init__(self):
         # import DSS event-time data
@@ -282,285 +285,6 @@ class OmicsWrapper:
     def get_omics_length(self): # remove 2 for the labels
         return self.df.shape[1] - 2
 
-from torch.nn import Parameter
-
-############
-# Omic Model
-############
-class MaxNet(nn.Module):
-    def __init__(self, 
-        input_dim=80, 
-        omic_dim=32,
-        dropout_rate=0.25, 
-        act=None, 
-        label_dim=1, 
-        init_max=True
-        ):
-        super(MaxNet, self).__init__()
-
-        hidden = [64, 48, 32, 32]
-        self.act = act
-        
-        encoder1 = nn.Sequential(
-            nn.Linear(input_dim, hidden[0]),
-            nn.ELU(),
-            nn.AlphaDropout(p=dropout_rate, inplace=False))
-        
-        encoder2 = nn.Sequential(
-            nn.Linear(hidden[0], hidden[1]),
-            nn.ELU(),
-            nn.AlphaDropout(p=dropout_rate, inplace=False))
-        
-        encoder3 = nn.Sequential(
-            nn.Linear(hidden[1], hidden[2]),
-            nn.ELU(),
-            nn.AlphaDropout(p=dropout_rate, inplace=False))
-        
-        encoder4 = nn.Sequential(
-            nn.Linear(hidden[2], omic_dim),
-            nn.ELU(),
-            nn.AlphaDropout(p=dropout_rate, inplace=False))
-        
-        self.encoder = nn.Sequential(encoder1, encoder2, encoder3, encoder4)
-        self.classifier = nn.Sequential(nn.Linear(omic_dim, label_dim))
-        
-        if init_max: init_max_weights(self)
-        
-        self.output_range = Parameter(torch.FloatTensor([6]), requires_grad=False)
-        self.output_shift = Parameter(torch.FloatTensor([-3]), requires_grad=False)
-
-    def forward(self, x):
-        # x comes in as one long vector 
-        # instead of width 95
-        # cannot solve the batching problem. just leave the reshape as is
-        omics_in = x.reshape([-1,OMICS_LEN])
-        
-        features = self.encoder(omics_in)
-        out = self.classifier(features)
-        if self.act is not None:
-            out = self.act(out)
-            if isinstance(self.act, nn.Sigmoid):
-                out = out * self.output_range + self.output_shift
-        
-        return features, out
-
-#############
-# Graph Model
-#############
-class GNN(torch.nn.Module):
-    def __init__(
-        self,
-        dim_features,dim_target,
-        layers=[16,16,8],
-        pooling='max',
-        dropout = 0.0,
-        conv='GINConv',
-        gembed=False,
-        **kwargs
-        ) -> None:
-        super(GNN, self).__init__()
-        self.dropout = dropout
-        self.embeddings_dim=layers
-        self.first_h = []
-        self.nns = []
-        self.convs = []
-        self.linears = []
-        self.pooling = {
-            'max':global_max_pool,
-            'mean':global_mean_pool,
-            'add':global_add_pool
-        }[pooling]
-        self.gembed = gembed 
-        # if gembed=True then learn graph embedding for final classification 
-        # (classify pooled node features), otherwise pool node decision scores
-        
-        for layer, out_emb_dim in enumerate(self.embeddings_dim):
-            # shufflenet = 1024 features
-            # features -> 0: 16, 1: 16, 2: 8, -> target
-            if layer == 0:
-                #first layer
-                self.first_h = Sequential(
-                    Linear(dim_features, out_emb_dim), 
-                    BatchNorm1d(out_emb_dim),
-                    GELU())
-                self.linears.append(Sequential(
-                    Linear(out_emb_dim, dim_target),
-                    GELU()))
-                
-            else:
-                prev_emb_dim = self.embeddings_dim[layer-1]
-                self.linears.append(Linear(out_emb_dim, dim_target))          
-                if conv=='GINConv':
-                    self.nns.append(Sequential(
-                        Linear(prev_emb_dim, out_emb_dim), 
-                        BatchNorm1d(out_emb_dim))) 
-                    self.convs.append(GINConv(self.nns[-1], **kwargs))  
-                    # Eq. 4.2 eps=100, train_eps=False
-                elif conv=='EdgeConv':
-                    self.nns.append(Sequential(
-                        Linear(2*prev_emb_dim, out_emb_dim), 
-                        BatchNorm1d(out_emb_dim)))         
-                    self.convs.append(EdgeConv(self.nns[-1],**kwargs))
-                    #DynamicEdgeConv#EdgeConv  aggr='mean'
-                else: raise NotImplementedError  
-        
-        self.linears = torch.nn.ModuleList(self.linears)  
-        # has got one more layer for initial input
-        self.nns = torch.nn.ModuleList(self.nns)
-        self.convs = torch.nn.ModuleList(self.convs)
-        
-    def forward(self, data) -> torch.tensor:
-        x, edge_index, batch, pooling = data.x, data.edge_index, data.batch, self.pooling
-        out = 0
-        Z_sum = 0
-        ##### convert x down from double? solves issue with the input to linear layers
-        ## but, loses some precision
-        x = x.float() 
-        
-        # Z_sum is the result of linear layers
-        import torch.nn.functional as F
-        for layer in range(len(self.embeddings_dim)):            
-            if layer == 0:
-                x = self.first_h(x)
-                z = self.linears[layer](x)
-                Z_sum += z
-                dout = F.dropout(pooling(z, batch), 
-                                p=self.dropout, training=self.training)
-                out += dout
-            else:
-                x = self.convs[layer-1](x,edge_index)
-                if not self.gembed:
-                    z = self.linears[layer](x)
-                    Z_sum += z
-                    dout = F.dropout(pooling(z, batch), 
-                                    p=self.dropout, training=self.training)
-                else:
-                    dout = F.dropout(self.linears[layer](pooling(x, batch)), 
-                                    p=self.dropout, training=self.training)
-                out += dout
-        return out,Z_sum,x
-
-############
-# Fusion
-############
-class SimpleFusion(nn.Module):
-    def __init__(self, dim1=32, dim2=32, dim_out=64, bilinear=True, cat_only=False):
-        super(SimpleFusion,self).__init__()
-        self.bilinear = bilinear
-        self.cat_only = cat_only
-        if self.bilinear:
-            self.fuse = nn.Bilinear(dim1, dim2, dim_out)
-            self.relu = nn.ReLU()
-        else:
-            self.fuse = nn.Sequential(nn.Linear(dim1+dim2, dim_out), nn.ReLU())
-        
-    def forward(self, vec1, vec2):
-        if self.bilinear:
-            return self.relu(self.fuse(vec1,vec2))
-        else:
-            conc = torch.cat((vec1,vec2),dim=1)
-            if self.cat_only: 
-                return conc
-            else: 
-                return self.fuse(conc)
-
-class BilinearFusion(nn.Module):
-    def __init__(self, 
-        skip=True, use_bilinear=True, 
-        gate1=True, gate2=True, 
-        dim1=32, dim2=32, 
-        scale_dim1=1, scale_dim2=1, 
-        out_dim=64, 
-        dropout_rate=0.25
-        ):
-        super(BilinearFusion, self).__init__()
-        self.skip = skip
-        self.use_bilinear = use_bilinear
-        self.gate1 = gate1
-        self.gate2 = gate2
-        
-        dim1_og, dim2_og = dim1, dim2
-        dim1, dim2 = dim1//scale_dim1, dim2//scale_dim2
-        skip_dim = dim1+dim2+2 if skip else 0
-        
-        # for graph vec
-        self.linear_h1 = nn.Sequential(
-            nn.Linear(dim1_og, dim1), 
-            nn.ReLU())
-        
-        self.linear_z1 = (
-            nn.Bilinear(dim1_og, dim2_og, dim1) if use_bilinear else 
-            nn.Sequential(nn.Linear(dim1_og+dim2_og, dim1)))
-        
-        self.linear_o1 = nn.Sequential(
-            nn.Linear(dim1, dim1), 
-            nn.ReLU(), 
-            nn.Dropout(p=dropout_rate))
-        
-        # for omics vec
-        self.linear_h2 = nn.Sequential(
-            nn.Linear(dim2_og, dim2), 
-            nn.ReLU())
-        
-        self.linear_z2 = (
-            nn.Bilinear(dim1_og, dim2_og, dim2) if use_bilinear else 
-            nn.Sequential(nn.Linear(dim1_og+dim2_og, dim2)))
-        
-        self.linear_o2 = nn.Sequential(
-            nn.Linear(dim2, dim2), 
-            nn.ReLU(), 
-            nn.Dropout(p=dropout_rate))
-        
-        self.post_fusion_dropout = nn.Dropout(p=dropout_rate)
-        self.encoder1 = nn.Sequential(
-            nn.Linear((dim1+1)*(dim2+1), out_dim), 
-            nn.ReLU(), 
-            nn.Dropout(p=dropout_rate))
-        self.encoder2 = nn.Sequential(
-            nn.Linear(out_dim+skip_dim, out_dim), 
-            nn.ReLU(), 
-            nn.Dropout(p=dropout_rate))
-        init_max_weights(self)
-
-    def forward(self, vec1, vec2):
-        ### Gated Multimodal Units
-        # h: rescale vec1/vec2 by scale_dim, pass relu
-        # z: bilinear/linear by concat with both vec input, output to be same size as corresponding h
-        # o: sigmoid of z multiplied by h as input to fc layer
-
-        if self.gate1:
-            h1 = self.linear_h1(vec1)
-            z1 = (
-                self.linear_z1(vec1, vec2) if self.use_bilinear else
-                self.linear_z1(torch.cat((vec1, vec2), dim=1)))
-            o1 = self.linear_o1(nn.Sigmoid()(z1)*h1)
-        else:
-            o1 = self.linear_o1(vec1)
-        
-        if self.gate2:
-            h2 = self.linear_h2(vec2)
-            z2 = (
-                self.linear_z2(vec1, vec2) if self.use_bilinear else 
-                self.linear_z2(torch.cat((vec1, vec2), dim=1)))
-            o2 = self.linear_o2(nn.Sigmoid()(z2)*h2)
-        else:
-            o2 = self.linear_o2(vec2)
-        
-        ### Fusion
-        # append 1 to the end of each feature vector in the batch
-        o1 = torch.cat((o1,torch.ones(o1.shape[0],1,dtype=torch.float, device='cuda')),1)
-        o2 = torch.cat((o2,torch.ones(o2.shape[0],1,dtype=torch.float, device='cuda')),1)
-        
-        o12 = torch.bmm(o1.unsqueeze(2), o2.unsqueeze(1)).flatten(start_dim=1) # BATCH_SIZE X 1024
-        
-        out = self.post_fusion_dropout(o12)
-        out = self.encoder1(out)
-        
-        if self.skip: out = torch.cat((out, o1, o2), 1)
-        
-        out = self.encoder2(out)
-        return out
-
 ##############################################################################
 # Graph + Omic
 ##############################################################################
@@ -591,7 +315,7 @@ class GraphomicNet(nn.Module):
 
         graph_target = 32
         
-        self.grph_net = GNN(
+        self.grph_net = SlideGraphGNN(
             dim_features=graph_features,
             dim_target = graph_target,
             layers = [64,64,32,32],
@@ -613,10 +337,8 @@ class GraphomicNet(nn.Module):
         if not args.omics_concat:
             self.omic_net = MaxNet(
                 input_dim=omic_input_len, 
-                omic_dim=32, 
+                out_dim=32, 
                 dropout_rate=0.25, 
-                act=None, 
-                label_dim=1,
                 init_max=True
                 ).to(DEVICE)
             ### need to decide what to do from here based on fusion strategy
@@ -662,7 +384,7 @@ class GraphomicNet(nn.Module):
         # must reshape after passing to net
         # print(f"Graph shape:{grph_vec.shape}")
         if not args.omics_concat:
-            omic_vec, _ = self.omic_net(data.omics_tensor)
+            omic_vec = self.omic_net(data.omics_tensor)
         else:
             omic_vec = data.omics_tensor
             omic_vec = omic_vec.reshape([-1,OMICS_LEN])
@@ -697,20 +419,17 @@ class GraphomicNet(nn.Module):
         return False
 
 class NetWrapper:
-    def __init__(self, omics_df : OmicsWrapper) -> None:
+    def __init__(self, omics_df : DFWrapper) -> None:
         self.omics_df = omics_df
         self.model = GraphomicNet(self.omics_df.get_omics_length()).to(DEVICE)
-        # self.optimizer = optim.Adam(self.model.parameters(),
-        #                             lr=LEARNING_RATE,
-        #                             weight_decay=WEIGHT_DECAY)
-        # try adamW?
+        # adam vs adamW?
         self.optimizer = optim.AdamW(self.model.parameters(),
                                      lr=LEARNING_RATE,
                                      weight_decay=WEIGHT_DECAY)
     
     def loss_fn(self,batch) -> float:
-        "batch input is a list of tuples of paired graph tags"
-        # this flattens list
+        #"batch input is a list of tuples of paired graph tags"
+        # following line flattens list
         unzipped = [j for pair in batch for j in pair]
         tag_set = list(set(unzipped))
         graphs = disk_graph_load(tag_set)
@@ -879,7 +598,7 @@ class Evaluator:
         results = logrank_test(T_low, T_high, E_low, E_high)
         print("p-value %s; log-rank %s" % (results.p_value, np.round(results.test_statistic, 6)))
 
-def GraphProcessing(omics_df:OmicsWrapper, tag_survlist):
+def GraphProcessing(omics_df:DFWrapper, tag_survlist):
     print("Pre-saving graphs.")
     for tag, label in tqdm(tag_survlist):
         G = MMLData(**(loadfromjson(tag)))
@@ -895,12 +614,12 @@ def GraphProcessing(omics_df:OmicsWrapper, tag_survlist):
         g.event = toTensor(label[0])
         g.e_time = toTensor(label[1])
         g.omics_tensor = toTensor(omics_df.get_tensor(tag))
-        torch.save(g, PKLDIR + '/' + tag + '.g')
+        torch.save(g, PKL_PATH + '/' + tag + '.g')
 
 if __name__ == '__main__':
     ### import survival data from file: DSS event and time
     print("Preparing omics.")
-    omics = OmicsWrapper()
+    omics = DFWrapper()
     print("Getting tags.")
     patient_tags = get_patient_tags()
     print("Matching to omics.")

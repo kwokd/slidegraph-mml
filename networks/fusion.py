@@ -1,13 +1,5 @@
 import torch
 import torch.nn as nn
-from torch.nn import BatchNorm1d, Sequential, Linear, ReLU,Tanh,LeakyReLU,ELU,SELU,GELU
-import torch.nn.functional as F
-import torch.optim as optim
-from torch.autograd import Variable
-from torch.utils.data import Dataset, Sampler
-
-from torchinfo import summary
-
 
 ############
 # Fusion
@@ -89,7 +81,7 @@ class BilinearFusion(nn.Module):
             nn.Linear(out_dim+skip_dim, out_dim), 
             nn.ReLU(), 
             nn.Dropout(p=dropout_rate))
-        init_max_weights(self)
+        # init_max_weights(self)
 
     def forward(self, vec1, vec2):
         ### Gated Multimodal Units

@@ -1,26 +1,11 @@
 import torch
-import torch.nn as nn
 from torch.nn import BatchNorm1d, Sequential, Linear, ReLU,Tanh,LeakyReLU,ELU,SELU,GELU
-import torch.nn.functional as F
-import torch.optim as optim
-from torch.autograd import Variable
-from torch.utils.data import Dataset, Sampler
-
-from torch_geometric.data import Data
-from torch_geometric.loader import DataLoader
 from torch_geometric.nn import GINConv,EdgeConv, PNAConv,DynamicEdgeConv,global_add_pool, global_mean_pool, global_max_pool
-
-from lifelines import KaplanMeierFitter
-from lifelines.utils import concordance_index as cindex
-from lifelines.plotting import add_at_risk_counts
-from lifelines.statistics import logrank_test
-
-from torchinfo import summary
 
 #############
 # Graph Model
 #############
-class GNN(torch.nn.Module):
+class SlideGraphGNN(torch.nn.Module):
     def __init__(
         self,
         dim_features,dim_target,
@@ -31,7 +16,7 @@ class GNN(torch.nn.Module):
         gembed=False,
         **kwargs
         ) -> None:
-        super(GNN, self).__init__()
+        super(SlideGraphGNN, self).__init__()
         self.dropout = dropout
         self.embeddings_dim=layers
         self.first_h = []
