@@ -105,8 +105,6 @@ PKL_PATH = {
 print(f"*****\nFeature set: {FEATURE_SET}\nNode features: {FEATURES}\nGraph path: {GRAPH_PATH}\nPickle path: {PKL_PATH}\n*****")
 
 # "directories"
-# BDIR = r'./graphs_json/'
-# PKLDIR = r'./graphs_pkl/'
 BDIR = GRAPH_PATH
 PKLDIR = PKL_PATH
 
@@ -600,6 +598,7 @@ class GraphomicNet(nn.Module):
             dropout = 0.0,
             pooling = 'mean', 
             conv='EdgeConv', 
+            gembed = True,
             aggr = 'max'
             ).to(DEVICE)
         
@@ -701,9 +700,13 @@ class NetWrapper:
     def __init__(self, omics_df : OmicsWrapper) -> None:
         self.omics_df = omics_df
         self.model = GraphomicNet(self.omics_df.get_omics_length()).to(DEVICE)
-        self.optimizer = optim.Adam(self.model.parameters(),
-                                    lr=LEARNING_RATE,
-                                    weight_decay=WEIGHT_DECAY)
+        # self.optimizer = optim.Adam(self.model.parameters(),
+        #                             lr=LEARNING_RATE,
+        #                             weight_decay=WEIGHT_DECAY)
+        # try adamW?
+        self.optimizer = optim.AdamW(self.model.parameters(),
+                                     lr=LEARNING_RATE,
+                                     weight_decay=WEIGHT_DECAY)
     
     def loss_fn(self,batch) -> float:
         "batch input is a list of tuples of paired graph tags"

@@ -1,4 +1,4 @@
-name: proj
+name: proj2
 channels:
   - sebp
   - pyg
@@ -269,4 +269,4 @@ dependencies:
   - zipp=3.17.0=py39h06a4308_0
   - zlib=1.2.13=h5eee18b_0
   - zstd=1.5.5=hc292b87_0
-prefix: /dcs/20/u2006813/.conda/envs/proj
+prefix: /dcs/20/u2006813/.conda/envs/proj2
