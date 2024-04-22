@@ -1,10 +1,11 @@
+#############
+# Graph Model
+#############
+
 import torch
 from torch.nn import BatchNorm1d, Sequential, Linear, ReLU,Tanh,LeakyReLU,ELU,SELU,GELU
 from torch_geometric.nn import GINConv,EdgeConv, PNAConv,DynamicEdgeConv,global_add_pool, global_mean_pool, global_max_pool
 
-#############
-# Graph Model
-#############
 class SlideGraphGNN(torch.nn.Module):
     def __init__(
         self,

@@ -76,6 +76,9 @@ from networks.graph_net import *
 from networks.omics_net import *
 from networks.fusion import *
 
+from utils.classes import *
+
+# print args to stdout and stderr
 print(args)
 print("*****")
 print(args, file=sys.stderr)
@@ -102,10 +105,15 @@ GRAPH_PATH = {
     "RES":'./data/graphs_resnet50/',
     "CC":'./data/graphs_cellcomp/'
 }[FEATURE_SET]
+# PKL_PATH = {
+#     "SHUFFLE":'./data/graphs_shufflenet_update/',
+#     "RES":'./data/graphs_resnet50_update/',
+#     "CC":'./data/graphs_cellcomp_update/'
+# }[FEATURE_SET]
 PKL_PATH = {
-    "SHUFFLE":'./data/graphs_shufflenet_update/',
-    "RES":'./data/graphs_resnet50_update/',
-    "CC":'./data/graphs_cellcomp_update/'
+    "SHUFFLE":'./data/graphs_shufflenet_new/',
+    "RES":'./data/graphs_resnet50_new/',
+    "CC":'./data/graphs_cellcomp_new/'
 }[FEATURE_SET]
 
 print(f"*****\nFeature set: {FEATURE_SET}\nNode features: {FEATURES}\nGraph path: {GRAPH_PATH}\nPickle path: {PKL_PATH}\n*****")
@@ -141,14 +149,6 @@ def toNumpy(v):
     if USE_CUDA: return v.detach().cpu().numpy()
     return v.detach().numpy()
 
-def pickleLoad(ifile):
-    with open(ifile, "rb") as f: return pickle.load(f)
-
-class MMLData(Data):
-    def __cat_dim__(self, key, value, *args, **kwargs):
-        if key == 'omics_tensor': return None
-        return super().__cat_dim__(key, value, *args, **kwargs)
-
 def toGeometricWW(X,W,y,tt=0):    
     # Data -> MMLData for better batching
     return MMLData(x=toTensor(X,requires_grad = False), 
@@ -179,18 +179,11 @@ def pair_find(data):
 def SplitOnEvent(event_time, numSplits, testSize):
     # event_time is a list of event-time tuples
     eventVars = [pair[0] for pair in event_time]
-    x = np.zeros(len(eventVars))
-    shuffleSplit = StratifiedShuffleSplit(n_splits = numSplits, test_size = testSize)
-    return shuffleSplit.split(x,eventVars)
-
-def disk_graph_load(batch):
-    # takes list of patient codes, returns list of corresponding loaded
-    # pkls (graph Data/MMLData objects)
-    loaded_graphs = [torch.load(PKL_PATH + '/' + graph + '.g') for graph in batch]
-    return [MMLData(**(data.to_dict())) for data in loaded_graphs]
+    shuffleSplit = StratifiedShuffleSplit(numSplits, test_size = testSize)
+    return shuffleSplit.split(np.zeros(len(eventVars)),eventVars)
+    # returns [(train_idx,vali_idx)]
 
 def get_predictions(model,graphs,device=torch.device('cuda:0')) -> list:
-    # removed dependency on omics_df, can cascade deletion
     outputs = []
     e_and_t = []
     
@@ -217,7 +210,6 @@ def get_patient_tags(directory = GRAPH_PATH):
     # first 12 characters of graph json filename should be the patient barcode
     json_list = glob(os.path.join(directory, "*.json"))
     return [os.path.split(filename)[-1][:12] for filename in json_list if "DX1" in filename]
-    # what does dx2 mean????
 
 def resolve_graph_filename(tag, directory = GRAPH_PATH):
     # takes a single patient tag, returns a single filename Path
@@ -228,9 +220,13 @@ def loadfromjson(tag):
     filename = resolve_graph_filename(tag)
     with Path(filename).open() as fptr: graph_dict = json.load(fptr)
     graph_dict = {k: torch.tensor(np.array(v)) for k, v in graph_dict.items()}
-    # return graph_dict 
-    # or should we cast to pyg Data? (G = Data(**graph_dict)) here?
-    return Data(**graph_dict).to(DEVICE)
+    return graph_dict
+
+def disk_graph_load(batch):
+    # takes list of patient codes, returns list of corresponding loaded
+    # pkls (graph Data/MMLData objects)
+    loaded_graphs = [torch.load(PKL_PATH + '/' + graph + '.g') for graph in batch]
+    return [MMLData(**(data.to_dict())) for data in loaded_graphs]
 
 def init_max_weights(module):
     for m in module.modules():
@@ -238,52 +234,6 @@ def init_max_weights(module):
             stdv = 1. / math.sqrt(m.weight.size(1))
             m.weight.data.normal_(0, stdv)
             m.bias.data.zero_()
-
-class DFWrapper:
-    # wrapper for the dataframe containing omics data
-    def __init__(self):
-        # import DSS event-time data
-        label = pd.read_excel(SURV_FILE).rename(columns={'bcr_patient_barcode':'PATIENT'}).set_index('PATIENT')
-        # filter to event/time columns for brca only
-        label = label[["DSS","DSS.time"]][label.type == 'BRCA']
-        
-        ### import genomic data
-        df = pd.read_excel(CLINI_FILE).set_index('PATIENT')
-        # print(df.shape)
-        
-        # one-hot for each mutation value
-        mut = pd.get_dummies(df.filter(regex="_mutation$"),dtype=float)
-
-        # log1p all expression values
-        expr = df.filter(regex="_expression$").apply(lambda x: [np.log1p(item) for item in x])
-
-        # standard scale across all of the cnv values
-        cnv = df.filter(regex="_CNV$|ZNF703")
-        scaler = preprocessing.StandardScaler().fit(cnv)
-        scaled = scaler.fit_transform(cnv)
-        
-        # join parts together
-        df = pd.DataFrame(scaled, columns=cnv.columns, index=cnv.index)
-
-        # due to inclusion of event-time data, should have 2 extra columns (97 vs 95)
-        self.df = df.join(expr).join(mut).join(label,"PATIENT","inner").dropna()
-        # print(self.df.shape)
-        
-    def get_tag_survlist(self, tags):
-        # given a list of graph tags, attach the event/time only to those
-        # that also exist in the dataframe (have omics), and add to a list
-        tag_survlist = []
-        for tag in tags:
-            if tag in self.df.index:
-                tag_survlist.append([tag, tuple(self.df.loc[tag,['DSS','DSS.time']])])
-        return tag_survlist
-    
-    def get_tensor(self,tag): # get row at tag as a pytorch tensor
-        row = self.df.loc[tag].drop(labels=["DSS","DSS.time"])
-        return torch.tensor(row.values,dtype=torch.float)
-    
-    def get_omics_length(self): # remove 2 for the labels
-        return self.df.shape[1] - 2
 
 ##############################################################################
 # Graph + Omic
@@ -310,14 +260,14 @@ class GraphomicNet(nn.Module):
         super(GraphomicNet, self).__init__()
 
         graph_features = FEATURES
-        omic_features = OMICS_LEN
+        omic_features = omic_input_len
         fusion_length = graph_features+omic_features
 
-        graph_target = 32
+        target_embedding = 32
         
-        self.grph_net = SlideGraphGNN(
+        self.graph_net = SlideGraphGNN(
             dim_features=graph_features,
-            dim_target = graph_target,
+            dim_target = target_embedding,
             layers = [64,64,32,32],
             dropout = 0.0,
             pooling = 'mean', 
@@ -327,8 +277,6 @@ class GraphomicNet(nn.Module):
             ).to(DEVICE)
         
         # maxnet will output a feature representation (size omic_dim)
-        # AND a classification (size label_dim)
-        
         # alternatively, we could concatenate the omics vector to the
         # graph feature rep and fuse directly from there
 
@@ -336,12 +284,11 @@ class GraphomicNet(nn.Module):
         # omics_concat - concatenate omics features to slidegraph features
         if not args.omics_concat:
             self.omic_net = MaxNet(
-                input_dim=omic_input_len, 
-                out_dim=32, 
+                input_dim=omic_features, 
+                out_dim=target_embedding, 
                 dropout_rate=0.25, 
                 init_max=True
                 ).to(DEVICE)
-            ### need to decide what to do from here based on fusion strategy
             if FUSION == "GATED":
                 self.fusion = BilinearFusion()
             elif FUSION == "BILINEAR":
@@ -352,37 +299,30 @@ class GraphomicNet(nn.Module):
                 self.fusion = SimpleFusion(bilinear=False,cat_only=True)
             else:
                 raise NotImplementedError()
+            # final layer will take output fused vector (64)
+            # and collapse to single value (1) by single linear layer
+            self.post_fusion = nn.Sequential(nn.Linear(64, 1))
         else:
             if FUSION == "GATED":
-                self.fusion = BilinearFusion(dim2=OMICS_LEN)
+                self.fusion = BilinearFusion(dim2=omic_input_len)
             elif FUSION == "BILINEAR":
-                self.fusion = SimpleFusion(dim2=OMICS_LEN, bilinear=True)
+                self.fusion = SimpleFusion(dim2=omic_input_len, bilinear=True)
             elif FUSION == "LINEAR":
-                self.fusion = SimpleFusion(dim2=OMICS_LEN, bilinear=False)
+                self.fusion = SimpleFusion(dim2=omic_input_len, bilinear=False)
             elif FUSION == "CONCAT":
-                self.fusion = SimpleFusion(dim2=OMICS_LEN, bilinear=False,cat_only=True)
+                self.fusion = SimpleFusion(dim2=omic_input_len, bilinear=False,cat_only=True)
             else:
                 raise NotImplementedError()
-        
-        # classifier will take output fused vector (64)
-        # and collapse to single value (1) by single linear layer
-        if not args.omics_concat:
-            self.classifier = nn.Sequential(nn.Linear(64, 1))
-        else:
-            print(graph_features+omic_features)
-            self.classifier = nn.Sequential(nn.Linear(graph_target+omic_features, 1))
+            print(fusion_length)
+            self.post_fusion = nn.Sequential(nn.Linear(fusion_length, 1))
+            
         self.act = act
-        
-        self.output_range = Parameter(torch.FloatTensor([6]), requires_grad=False)
-        self.output_shift = Parameter(torch.FloatTensor([-3]), requires_grad=False)
 
     def forward(self, data):
-        grph_vec, _, _ = self.grph_net(data)
-        ### additional option to not use the net? and concat directly
+        graph_vec, _, _ = self.graph_net(data)
+        # print(f"Graph shape:{graph_vec.shape}")
 
-        # batched, so omics tensor is concatenated to single long vector. 
-        # must reshape after passing to net
-        # print(f"Graph shape:{grph_vec.shape}")
+        ### option to not use the net? and concat directly
         if not args.omics_concat:
             omic_vec = self.omic_net(data.omics_tensor)
         else:
@@ -392,36 +332,32 @@ class GraphomicNet(nn.Module):
         
         if FUSION == "GATED":
             # original logic
-            features = self.fusion(grph_vec, omic_vec)
-            hazard = self.classifier(features)
-            
+            features = self.fusion(graph_vec, omic_vec)
+            hazard = self.post_fusion(features)
             if self.act is not None:
                 hazard = self.act(hazard)
-                if isinstance(self.act, nn.Sigmoid):
-                    hazard = hazard * self.output_range + self.output_shift
             
             return hazard, features
         else:
-            features = self.fusion(grph_vec, omic_vec)
-            hazard = self.classifier(features)
+            features = self.fusion(graph_vec, omic_vec)
+            hazard = self.post_fusion(features)
             return hazard, features
 
     def __hasattr__(self, name):
-        if '_parameters' in self.__dict__:
-            if name in self.__dict__['_parameters']:
-                return True
-        if '_buffers' in self.__dict__:
-            if name in self.__dict__['_buffers']:
-                return True
-        if '_modules' in self.__dict__:
-            if name in self.__dict__['_modules']:
-                return True
-        return False
+        if '_parameters' in self.__dict__ and name in self.__dict__['_parameters']:
+            return True
+        elif '_buffers' in self.__dict__ and name in self.__dict__['_buffers']:
+            return True
+        elif '_modules' in self.__dict__ and name in self.__dict__['_modules']:
+            return True
+        else: return False
 
 class NetWrapper:
     def __init__(self, omics_df : DFWrapper) -> None:
         self.omics_df = omics_df
-        self.model = GraphomicNet(self.omics_df.get_omics_length()).to(DEVICE)
+        omic_len = self.omics_df.get_omics_length()
+        
+        self.model = GraphomicNet(omic_len).to(DEVICE)
         # adam vs adamW?
         self.optimizer = optim.AdamW(self.model.parameters(),
                                      lr=LEARNING_RATE,
@@ -433,9 +369,6 @@ class NetWrapper:
         unzipped = [j for pair in batch for j in pair]
         tag_set = list(set(unzipped))
         graphs = disk_graph_load(tag_set)
-
-        # for graph in graphs:
-        #     print(graph)
         
         batch_load = DataLoader(graphs, batch_size = len(graphs))
         for data in batch_load:
@@ -479,11 +412,10 @@ class NetWrapper:
         return epoch_val_loss, concord
     
     def censor_data(self, graphs, censor_time): 
-        "given censor_time in years, censor individual times if greater than input."
+        # given a threshold in years, censor individual times if greater
         cen_time = 365 * censor_time
         for graph in graphs:
-            time = graph[1][1]
-            if time > cen_time: graph[1] = (0,cen_time)
+            if graph[1][1] > cen_time: graph[1] = (0,cen_time)
         return graphs
     
     def train(self,training_data,validation_data=None,
@@ -526,7 +458,8 @@ class NetWrapper:
                 loss = self.loss_fn(batch_pairs)
                 
                 counter += batch_size
-            else: counter = 0
+            else: 
+                counter = 0
             loss_vals['train'].append(loss)
             if validation_data is not None:
                 if i % log_interval == 0:
@@ -619,7 +552,7 @@ def GraphProcessing(omics_df:DFWrapper, tag_survlist):
 if __name__ == '__main__':
     ### import survival data from file: DSS event and time
     print("Preparing omics.")
-    omics = DFWrapper()
+    omics = DFWrapper(SURV_FILE, CLINI_FILE)
     print("Getting tags.")
     patient_tags = get_patient_tags()
     print("Matching to omics.")
@@ -627,7 +560,8 @@ if __name__ == '__main__':
     ## format is [[TAG,(event,time)]]
     
     # # bind omics tensor to slidegraph, pickle and store
-    if(PROCESS_GRAPHS): GraphProcessing(omics,tag_survlist)
+    if(PROCESS_GRAPHS): 
+        GraphProcessing(omics,tag_survlist)
     
     trainingDataset = tag_survlist
     folds = 5
@@ -650,7 +584,7 @@ if __name__ == '__main__':
         losses, concords, BestModel = net.train(x_train,
                                                 return_best = True,
                                                 max_batches = NUM_BATCHES)
-        # Evaluate for fold
+        # Evaluate on test dataset for current fold
         testDataset = [trainingDataset[i] for i in vali_index]
         testDataset = net.censor_data(testDataset,10)
         eval = Evaluator(BestModel)

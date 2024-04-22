@@ -1,3 +1,7 @@
+############
+# Omic Model
+############
+
 import torch
 import torch.nn as nn
 from torch.nn import BatchNorm1d, Sequential, Linear, ReLU,Tanh,LeakyReLU,ELU,SELU,GELU
@@ -6,9 +10,8 @@ from torch.autograd import Variable
 from torch.utils.data import Dataset, Sampler
 from torch.nn import Parameter
 
-############
-# Omic Model
-############
+# batched, so omics tensor is concatenated to single long vector. 
+# must reshape after passing to net
 class MaxNet(nn.Module):
     def __init__(self, 
         input_dim=95,
@@ -47,6 +50,7 @@ class MaxNet(nn.Module):
         # if init_max: init_max_weights(self)
 
     def forward(self, x):
+        
         # x comes in as one long vector instead of width 95
         # cannot solve the batching problem. just leave the reshape as is
         omics_in = x.reshape([-1,self.input_dim])
