@@ -156,12 +156,10 @@ def toGeometricWW(X,W,y,tt=0):
                     y=toTensor([y],dtype=torch.long,requires_grad = False))
 
 def pair_find(data):
-    """
-    from data [[tag,(event,time)]], 
-    produces list of tuple pairs (i,j): 
-    i, j are indices of graphs in the training data list, 
-    where time(i) > time(j)
-    """
+    # data is in the form [[tag,(event,time)]]
+    # produces list of tuple indexes (i,j): 
+    #   i, j are indexes of graphs in the training data list, 
+    #   where time(i) > time(j)
     indexes = []
     for j in range(len(data)):
         graph_j = data[j]
@@ -178,10 +176,12 @@ def pair_find(data):
 
 def SplitOnEvent(event_time, numSplits, testSize):
     # event_time is a list of event-time tuples
-    eventVars = [pair[0] for pair in event_time]
-    shuffleSplit = StratifiedShuffleSplit(numSplits, test_size = testSize)
-    return shuffleSplit.split(np.zeros(len(eventVars)),eventVars)
     # returns [(train_idx,vali_idx)]
+    eventVars = [pair[0] for pair in event_time]
+    # shuffleSplit = StratifiedShuffleSplit(numSplits, test_size = testSize)
+    # return shuffleSplit.split(np.zeros(len(eventVars)),eventVars)
+    stratifiedsplit = StratifiedKFold(numSplits, shuffle=True)
+    return stratifiedsplit.split(np.zeros(len(eventVars)), eventVars)
 
 def get_predictions(model,graphs,device=torch.device('cuda:0')) -> list:
     outputs = []
@@ -205,11 +205,15 @@ def get_predictions(model,graphs,device=torch.device('cuda:0')) -> list:
             e_and_t.append(temp)
     return outputs, e_and_t
 
-def get_patient_tags(directory = GRAPH_PATH):
+def get_patient_tags(combined = False):
     # returns a list of all patient tags that have json graph data
     # first 12 characters of graph json filename should be the patient barcode
-    json_list = glob(os.path.join(directory, "*.json"))
-    return [os.path.split(filename)[-1][:12] for filename in json_list if "DX1" in filename]
+    if combined == False:
+        json_list = glob(os.path.join(GRAPH_PATH, "*.json"))
+        return [os.path.split(filename)[-1][:12] for filename in json_list if "DX1" in filename]
+    else:
+        pkl_list = glob(os.path.join(PKL_PATH, "*.g"))
+        return [os.path.split(filename)[-1][:12] for filename in pkl_list]
 
 def resolve_graph_filename(tag, directory = GRAPH_PATH):
     # takes a single patient tag, returns a single filename Path
@@ -353,12 +357,11 @@ class GraphomicNet(nn.Module):
         else: return False
 
 class NetWrapper:
-    def __init__(self, omics_df : DFWrapper) -> None:
-        self.omics_df = omics_df
-        omic_len = self.omics_df.get_omics_length()
+    def __init__(self) -> None:
+        # omic_len = 95
+        omic_len = 20971
         
         self.model = GraphomicNet(omic_len).to(DEVICE)
-        # adam vs adamW?
         self.optimizer = optim.AdamW(self.model.parameters(),
                                      lr=LEARNING_RATE,
                                      weight_decay=WEIGHT_DECAY)
@@ -418,64 +421,43 @@ class NetWrapper:
             if graph[1][1] > cen_time: graph[1] = (0,cen_time)
         return graphs
     
-    def train(self,training_data,validation_data=None,
+    def train(self,tag_survlist,
                 max_batches=500,
-                num_logs=50, early_stopping = 10,return_best = False,
-                batch_size = 10) -> float:
-        # format of training_data: [TAG,(event,event_time)]
-        
-        return_best = return_best and validation_data is not None
-        log_interval = max_batches // num_logs
-        
+                batch_size = 10,
+                early_stopping = 10
+                ) -> float:
+        # format of tag_survlist: [TAG,(event,event_time)]
         loss_vals = { 'train': [], 'validation': [] }
-        
-        concords = []
-        c_best = 0.5
         best_batch = 1000
-        patience = early_stopping
         
-        training_indexes = pair_find(training_data)
+        training_indexes = pair_find(tag_survlist)
         
         print("Number of batches used for training " + str(max_batches))
         print('Num Pairs: ' + str(len(training_indexes)))
         
-        if validation_data is not None:
-            validation_indexes = pair_find(validation_data)
-        
         # To resolve list index errors with large NUM_BATCHES vals
         counter = 0 
         
-        ### understand the batching logic next TODO
+        ## get batch of pairs, with length batch_size (10 -> 10 pairs).
+        # perform loss calculation, backprop for that batch
+        # iterate for next stretch within that length, until max batches is reached.
         for i in tqdm(range(max_batches)):
             if counter < len(training_indexes) - batch_size:
                 batch_pairs = []
                 index_pairs = training_indexes[counter:counter+batch_size]
                 
                 for l_index, r_index in index_pairs:
-                    batch_pairs.append((training_data[l_index][0],training_data[r_index][0]))
+                    batch_pairs.append((tag_survlist[l_index][0],
+                                        tag_survlist[r_index][0]))
                 
-                #batch pairs will consist of patient tags
+                # batch pairs will consist of patient tags
                 loss = self.loss_fn(batch_pairs)
                 
                 counter += batch_size
             else: 
                 counter = 0
             loss_vals['train'].append(loss)
-            if validation_data is not None:
-                if i % log_interval == 0:
-                    val_loss, c_val = self.validation_loss_and_Cindex_eval(validation_data,validation_indexes)
-                    loss_vals['validation'].append(val_loss)
-                    concords.append(c_val)
-                    print("Current Vali Loss Val: " + str(val_loss) + "\n")
-                    print("\n" + "Current Loss Val: " + str(loss) + "\n")
-                    if return_best and c_val > c_best:
-                        c_best = c_val
-                        #best_model = deepcopy(model)
-                        best_batch = i
-                    if i - best_batch > patience*log_interval:
-                        print("Early Stopping")
-                        #break
-        return loss_vals, concords, self.model
+        return loss_vals, self.model
     
 class Evaluator:
     def __init__(self, model) -> None:
@@ -489,7 +471,6 @@ class Evaluator:
         return concord
     
     def K_M_Curves(self, graphs, split_val, mode = 'Train') -> None:
-        #unused for now?
         outputs, e_and_t = get_predictions(self.model,graphs)
         T = [x[1] for x in e_and_t]
         E = [x[0] for x in e_and_t]
@@ -498,7 +479,7 @@ class Evaluator:
             if split_val > 0:
                 mid = split_val
         else:
-            print(mid)
+            print(f"Mid: {mid}")
         T_high = []
         T_low = []
         E_high = [] 
@@ -531,76 +512,82 @@ class Evaluator:
         results = logrank_test(T_low, T_high, E_low, E_high)
         print("p-value %s; log-rank %s" % (results.p_value, np.round(results.test_statistic, 6)))
 
-def GraphProcessing(omics_df:DFWrapper, tag_survlist):
-    print("Pre-saving graphs.")
-    for tag, label in tqdm(tag_survlist):
-        G = MMLData(**(loadfromjson(tag)))
-        try:
-            G.y = toTensorGPU([int(label[1])], dtype=torch.long, requires_grad = False)
-        except ValueError:
-            continue
-        # creates new graph edges, where nodes that are 1500 apart are connected to each other
-        W = radius_neighbors_graph(toNumpy(G.coords), 1500, mode="connectivity",include_self=False).toarray()
-        g = toGeometricWW(toNumpy(G.x),W,toNumpy(G.y))
-        # is this MMLData? or Data?
-        g.coords = G.coords
-        g.event = toTensor(label[0])
-        g.e_time = toTensor(label[1])
-        g.omics_tensor = toTensor(omics_df.get_tensor(tag))
-        torch.save(g, PKL_PATH + '/' + tag + '.g')
-
 if __name__ == '__main__':
     ### import survival data from file: DSS event and time
-    print("Preparing omics.")
-    omics = DFWrapper(SURV_FILE, CLINI_FILE)
-    print("Getting tags.")
-    patient_tags = get_patient_tags()
-    print("Matching to omics.")
-    tag_survlist = omics.get_tag_survlist(patient_tags)
-    ## format is [[TAG,(event,time)]]
-    
-    # # bind omics tensor to slidegraph, pickle and store
+    print("Loading survival data.")
+    surv = SurvWrapper()
+
     if(PROCESS_GRAPHS): 
-        GraphProcessing(omics,tag_survlist)
-    
-    trainingDataset = tag_survlist
-    folds = 5
-    
+        # need to combine omics data with graphs
+        # bind omics tensor to slidegraph, pickle and store
+        print("Preparing omics to pair with graphs.")
+        omics = DFWrapperLarge()
+
+        # get a list of tags from graph directory, filter by presence in omics/surv
+        print("Getting patient tags.")
+        patient_tags = get_patient_tags(combined=False)
+        patient_tags = omics.filter_tags(patient_tags)
+        tag_survlist = surv.get_tag_survlist(patient_tags)
+
+        print("Pre-processing graphs.")
+        for tag, e_t in tqdm(tag_survlist):
+            G = MMLData(**(loadfromjson(tag)))
+            try:
+                G.y = toTensorGPU([int(e_t[1])], dtype=torch.long, requires_grad = False)
+            except ValueError:
+                continue
+
+            # W is new edge set. connect nodes that are 1500 apart
+            W = radius_neighbors_graph(toNumpy(G.coords), 1500, mode="connectivity",include_self=False).toarray()
+            g = toGeometricWW(toNumpy(G.x),W,toNumpy(G.y))
+
+            g.coords = G.coords
+            g.event = toTensor(e_t[0])
+            g.e_time = toTensor(e_t[1])
+            g.omics_tensor = toTensor(omics.get_tensor(tag))
+            torch.save(g, PKL_PATH + '/' + tag + '.g')
+
+    else:
+        # pkl'd graph data also contains omics.
+        # get list of tags from pkl directory
+        print("Getting patient tags.")
+        patient_tags = get_patient_tags(combined=True)
+        print(patient_tags)
+        tag_survlist = surv.get_tag_survlist(patient_tags)
+
+    ## tag_survlist format is [[TAG,(event,time)]]
+
     converg_vals = []
-    fold_concord = []
     eval_metrics = []
+
+    folds = 5
+    event_time = [item[1] for item in tag_survlist]
+    print(event_time)
     
-    e_t_list = [item[1] for item in tag_survlist]
-    
-    # get indices for training and testing
-    for fold, (train_index, vali_index) in enumerate(SplitOnEvent(e_t_list, folds, FRAC_VAL)):
+    # get indexes for training and testing
+    for fold, (train_indexes, test_indexes) in enumerate(SplitOnEvent(event_time, folds, FRAC_VAL)):
         print(f"NOW ON FOLD {fold+1}\n*****")
-        net = NetWrapper(omics)
-        # x_train is the subset of trainingDataset at the split indices
-        x_train = [trainingDataset[i] for i in train_index]
-        e_t_train = [e_t_list[i] for i in train_index]
-        # Only censoring the test data
-        # x_val = net.censor_data(x_val,10) 
-        losses, concords, BestModel = net.train(x_train,
-                                                return_best = True,
-                                                max_batches = NUM_BATCHES)
-        # Evaluate on test dataset for current fold
-        testDataset = [trainingDataset[i] for i in vali_index]
-        testDataset = net.censor_data(testDataset,10)
-        eval = Evaluator(BestModel)
-        concord = eval.test_evaluation(testDataset)
-        print(concord)
-        
+        net = NetWrapper()
+
+        # x_train is the subset of tag_survlist at the split indexes
+        x_train = [tag_survlist[i] for i in train_indexes]
+        losses, model = net.train(x_train, max_batches = NUM_BATCHES)
         converg_vals.append(losses)
-        fold_concord.append(concords)
-        # fold_concord and converg_vals are never used?
+
+        # Evaluate on test dataset for current fold
+        testDataset = [tag_survlist[i] for i in test_indexes]
+        testDataset = net.censor_data(testDataset,10)
+        eval = Evaluator(model)
+        concord = eval.test_evaluation(testDataset)
+        print(f"Concordance for this fold: {concord}")
         eval_metrics.append(concord)
-        #m = max(concords)
+
         if not args.noplot:
+            print("Plotting curves.")
             eval.K_M_Curves(testDataset,None)
     
     if args.modelsummary:
-        print(summary(BestModel))
+        print(summary(model))
     
     avg_c = mean(eval_metrics)
     stdev_c = stdev(eval_metrics)

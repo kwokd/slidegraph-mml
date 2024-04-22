@@ -11,7 +11,7 @@ class MMLData(Data):
         return super().__cat_dim__(key, value, *args, **kwargs)
     
 class DFWrapper:
-    # wrapper for the dataframe containing omics data
+    # wrapper for the dataframe containing omics data (old)
     def __init__(self, surv_path, clini_path):
         # import DSS event-time data
         label = pd.read_excel(surv_path).rename(columns={'bcr_patient_barcode':'PATIENT'}).set_index('PATIENT')
@@ -60,7 +60,7 @@ class SurvWrapper:
     def __init__(self, supp_path=r'./data/NIHMS978596-supplement-1.xlsx'):
         df = pd.read_excel(supp_path).rename(columns={'bcr_patient_barcode':'case_id'}).set_index('case_id')
         df = df[["DSS","DSS.time"]][df.type == 'BRCA']
-        self.df = df
+        self.df = df.dropna()
     
     def get_tag_survlist(self, tags):
         # given a list of graph tags, attach the event/time only to those
@@ -68,7 +68,7 @@ class SurvWrapper:
         return [[tag, tuple(self.df.loc[tag,['DSS','DSS.time']])] for tag in tags if tag in self.df.index]
     
 class DFWrapperLarge:
-    def __init__(self, csv_path=r'./data/omics/tcga_brca_all_clean.csv'):
+    def __init__(self, csv_path=r'./data/omics/tcga_brca_omic.csv'):
         df = pd.read_csv(csv_path).set_index('case_id')
 
         # Filter rows based on column: 'slide_id'
